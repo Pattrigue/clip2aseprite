@@ -1,312 +1,721 @@
-// clip2aseprite core: Clip Studio Paint (.clip) animation -> flattened .aseprite
-// Port of clip2aseprite.py. Runs in browsers and Node 18+ (needs DecompressionStream,
-// CompressionStream and an initialised sql.js `SQL` object).
+// clip2aseprite: convert a Clip Studio Paint animation (.clip) into a flattened .aseprite file.
+//
+// This is the browser version of clip2aseprite.py and follows the same steps; see that
+// file for the same logic in Python. Runs in browsers and Node 18+. It needs
+// DecompressionStream, CompressionStream and an initialised sql.js `SQL` object.
+//
+// Public API:  Clip2Ase.convert(SQL, clipBytes, { fps, layerName }) -> result
+
 (function (root) {
   "use strict";
 
-  const TIME_UNITS_PER_FRAME = 5; // CSP timeline time units per frame
-  const BLOCK = 256;              // CSP offscreen tile size
-  const LAYER_FOLDER = 0, LAYER_RASTER = 1;
+  // CSP layer types (Layer.LayerType)
+  const LAYER_FOLDER = 0;
+  const LAYER_RASTER = 1;
+
+  // CSP timeline track that shows one animation cel (Track.TrackKind)
   const TRACK_KIND_CEL = 1000;
 
-  // ------------------------------------------------------------------ helpers
-  const utf16be = (s) => {
-    const b = new Uint8Array(s.length * 2);
-    for (let i = 0; i < s.length; i++) { b[2 * i] = s.charCodeAt(i) >> 8; b[2 * i + 1] = s.charCodeAt(i) & 255; }
-    return b;
-  };
-  const latin1 = (b) => String.fromCharCode.apply(null, b);
-  function indexOf(hay, needle, from = 0) {
-    const n = needle.length, first = needle[0];
-    outer: for (let i = hay.indexOf(first, from); i !== -1 && i <= hay.length - n; i = hay.indexOf(first, i + 1)) {
-      for (let j = 1; j < n; j++) if (hay[i + j] !== needle[j]) continue outer;
-      return i;
+  // The CSP timeline measures time in 1/5 frame units (a 12-frame animation ends at 60).
+  const TIME_UNITS_PER_FRAME = 5;
+
+  // Layer pixels are stored as square tiles of this size.
+  const TILE_SIZE = 256;
+
+  // Aseprite chunk types
+  const ASE_COLOR_PROFILE = 0x2007;
+  const ASE_PALETTE = 0x2019;
+  const ASE_LAYER = 0x2004;
+  const ASE_CEL = 0x2005;
+
+
+  // ===========================================================================
+  // Small helpers
+  // ===========================================================================
+
+  function utf16be(text) {
+    const bytes = new Uint8Array(text.length * 2);
+    for (let i = 0; i < text.length; i++) {
+      bytes[2 * i] = text.charCodeAt(i) >> 8;
+      bytes[2 * i + 1] = text.charCodeAt(i) & 255;
     }
+    return bytes;
+  }
+
+  function latin1(bytes) {
+    return String.fromCharCode.apply(null, bytes);
+  }
+
+  // Position of `needle` in `haystack` at or after `from`, or -1.
+  function findBytes(haystack, needle, from = 0) {
+    let i = haystack.indexOf(needle[0], from);
+
+    while (i !== -1 && i <= haystack.length - needle.length) {
+      let matches = true;
+      for (let j = 1; j < needle.length; j++) {
+        if (haystack[i + j] !== needle[j]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) return i;
+
+      i = haystack.indexOf(needle[0], i + 1);
+    }
+
     return -1;
   }
-  const u32be = (b, o) => ((b[o] << 24) >>> 0) + (b[o + 1] << 16) + (b[o + 2] << 8) + b[o + 3];
-  const u32le = (b, o) => ((b[o + 3] << 24) >>> 0) + (b[o + 2] << 16) + (b[o + 1] << 8) + b[o];
-  const u64be = (b, o) => u32be(b, o) * 2 ** 32 + u32be(b, o + 4);
 
-  async function pipe(bytes, stream) {
-    const out = new Response(new Blob([bytes]).stream().pipeThrough(stream));
-    return new Uint8Array(await out.arrayBuffer());
+  function readU32BE(bytes, pos) {
+    return new DataView(bytes.buffer, bytes.byteOffset + pos, 4).getUint32(0, false);
   }
-  const inflate = (b) => pipe(b, new DecompressionStream("deflate"));
-  const deflate = (b) => pipe(b, new CompressionStream("deflate"));
 
-  // numpy-compatible round half to even
+  function readU32LE(bytes, pos) {
+    return new DataView(bytes.buffer, bytes.byteOffset + pos, 4).getUint32(0, true);
+  }
+
+  function readU64BE(bytes, pos) {
+    return readU32BE(bytes, pos) * 2 ** 32 + readU32BE(bytes, pos + 4);
+  }
+
+  async function runThroughStream(bytes, stream) {
+    const response = new Response(new Blob([bytes]).stream().pipeThrough(stream));
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  // "deflate" in the Streams API means zlib format, which is what both file formats use.
+  function zlibDecompress(bytes) {
+    return runThroughStream(bytes, new DecompressionStream("deflate"));
+  }
+
+  function zlibCompress(bytes) {
+    return runThroughStream(bytes, new CompressionStream("deflate"));
+  }
+
+  // Round half to even, like numpy, so results match the Python version exactly.
   function roundHalfEven(x) {
-    const r = Math.round(x);
-    return (Math.abs(x % 1) === 0.5 && r % 2 !== 0) ? r - 1 : r;
+    const rounded = Math.round(x);
+    const isHalf = Math.abs(x % 1) === 0.5;
+    return isHalf && rounded % 2 !== 0 ? rounded - 1 : rounded;
   }
 
-  // ------------------------------------------------------------------ .clip container
-  function readContainer(d) {
-    if (latin1(d.subarray(0, 8)) !== "CSFCHUNK") throw new Error("This is not a Clip Studio Paint (.clip) file.");
-    let p = 24, sql = null;
-    const ext = new Map();
-    while (p + 16 <= d.length) {
-      const name = latin1(d.subarray(p, p + 8));
-      const len = u64be(d, p + 8);
-      const body = d.subarray(p + 16, p + 16 + len);
-      if (name === "CHNKExta") {
-        const il = u64be(body, 0);
-        ext.set(latin1(body.subarray(8, 8 + il)), body.subarray(8 + il));
-      } else if (name === "CHNKSQLi") sql = body;
-      p += 16 + len;
-    }
-    if (!sql) throw new Error("The .clip file has no layer database (is it damaged?).");
-    return { sql, ext };
-  }
+  function sqlQuery(db, sql, params) {
+    const statement = db.prepare(sql);
+    if (params) statement.bind(params);
 
-  function query(db, sql, params) {
-    const st = db.prepare(sql);
-    if (params) st.bind(params);
     const rows = [];
-    while (st.step()) rows.push(st.getAsObject());
-    st.free();
+    while (statement.step()) rows.push(statement.getAsObject());
+
+    statement.free();
     return rows;
   }
 
-  // ------------------------------------------------------------------ pixels
-  async function decodeOffscreen(attr, data) {
-    const key = utf16be("Parameter");
-    let i = indexOf(attr, key);
-    if (i < 0) throw new Error("Unrecognised layer pixel format.");
-    i += key.length;
-    const width = u32be(attr, i), height = u32be(attr, i + 4), bw = u32be(attr, i + 8);
-    const out = new Uint8Array(width * height * 4);
-    const marker = utf16be("BlockDataBeginChunk");
-    for (let m = indexOf(data, marker); m !== -1; m = indexOf(data, marker, m + 1)) {
-      const p = m + marker.length;
-      const idx = u32be(data, p), exists = u32be(data, p + 16);
-      if (!exists) continue;
-      const clen = u32le(data, p + 24);
-      const raw = await inflate(data.subarray(p + 28, p + 28 + clen));
-      if (raw.length !== BLOCK * BLOCK * 5) throw new Error("Only 32-bit colour layers are supported.");
-      const bx = (idx % bw) * BLOCK, by = Math.floor(idx / bw) * BLOCK;
-      for (let y = 0; y < BLOCK; y++) {
-        const oy = by + y;
-        if (oy >= height) break;
-        for (let x = 0; x < BLOCK; x++) {
-          const ox = bx + x;
-          if (ox >= width) break;
-          const s = y * BLOCK + x, c = BLOCK * BLOCK + s * 4, o = (oy * width + ox) * 4;
-          out[o] = raw[c + 2]; out[o + 1] = raw[c + 1]; out[o + 2] = raw[c]; out[o + 3] = raw[s];
-        }
-      }
+
+  // ===========================================================================
+  // Reading the .clip container
+  // ===========================================================================
+  //
+  // A .clip file is a "CSFCHUNK" header followed by chunks. Each chunk is an
+  // 8-byte name, an 8-byte big-endian length and then the data:
+  //
+  //   CHNKHead   file header
+  //   CHNKExta   "external" data blob (pixels, timeline keys), named "extrnlid..."
+  //   CHNKSQLi   a SQLite database describing the document
+  //   CHNKFoot   end marker
+  //
+  // Database rows refer to external blobs by their name.
+
+  function readClip(data) {
+    if (latin1(data.subarray(0, 8)) !== "CSFCHUNK") {
+      throw new Error("This is not a Clip Studio Paint (.clip) file.");
     }
-    return { width, height, px: out };
+
+    const externals = new Map();
+    let database = null;
+
+    let pos = 24; // skip the file header
+    while (pos + 16 <= data.length) {
+      const chunkName = latin1(data.subarray(pos, pos + 8));
+      const chunkLength = readU64BE(data, pos + 8);
+      const body = data.subarray(pos + 16, pos + 16 + chunkLength);
+
+      if (chunkName === "CHNKExta") {
+        const nameLength = readU64BE(body, 0);
+        const name = latin1(body.subarray(8, 8 + nameLength));
+        externals.set(name, body.subarray(8 + nameLength));
+      } else if (chunkName === "CHNKSQLi") {
+        database = body;
+      }
+
+      pos += 16 + chunkLength;
+    }
+
+    if (!database) {
+      throw new Error("The .clip file has no layer database (is it damaged?).");
+    }
+
+    return { database, externals };
   }
 
-  // straight-alpha "over", Float64, same operation order as the Python/numpy version
-  function blendNormal(dst, src, opacity) {
-    for (let i = 0; i < dst.length; i += 4) {
-      const sa = src[i + 3] * opacity, da = dst[i + 3];
-      const oa = sa + da * (1 - sa);
-      for (let k = 0; k < 3; k++) {
-        dst[i + k] = oa > 0 ? (src[i + k] * sa + dst[i + k] * da * (1 - sa)) / oa : 0;
+
+  // ===========================================================================
+  // Layer pixels
+  // ===========================================================================
+  //
+  // A layer's pixels ("offscreen") are split into 256x256 tiles. The offscreen's
+  // Attribute blob holds its size and the number of tiles across/down. The pixel
+  // blob contains one "BlockDataBeginChunk" record per tile:
+  //
+  //   u32 tile index, u32 uncompressed size, u32 width, u32 height, u32 has_data,
+  //   u32 ?, u32 compressed length (little-endian!), zlib data
+  //
+  // Decompressed, a tile is a 256x256 alpha plane followed by 256x256 BGRA pixels
+  // (the A of BGRA is unused).
+
+  async function decodeOffscreen(attribute, data) {
+    const parameter = utf16be("Parameter");
+    const paramPos = findBytes(attribute, parameter);
+    if (paramPos < 0) throw new Error("Unrecognised layer pixel format.");
+
+    const sizePos = paramPos + parameter.length;
+    const width = readU32BE(attribute, sizePos);
+    const height = readU32BE(attribute, sizePos + 4);
+    const tilesAcross = readU32BE(attribute, sizePos + 8);
+
+    const pixels = new Uint8Array(width * height * 4);
+
+    const marker = utf16be("BlockDataBeginChunk");
+    for (let found = findBytes(data, marker); found !== -1; found = findBytes(data, marker, found + 1)) {
+      const pos = found + marker.length;
+
+      const tileIndex = readU32BE(data, pos);
+      const hasData = readU32BE(data, pos + 16);
+      if (!hasData) continue;
+
+      const compressedLength = readU32LE(data, pos + 24);
+      const raw = await zlibDecompress(data.subarray(pos + 28, pos + 28 + compressedLength));
+
+      if (raw.length !== TILE_SIZE * TILE_SIZE * 5) {
+        throw new Error("Only 32-bit colour layers are supported.");
       }
-      dst[i + 3] = oa;
+
+      const tileLeft = (tileIndex % tilesAcross) * TILE_SIZE;
+      const tileTop = Math.floor(tileIndex / tilesAcross) * TILE_SIZE;
+      copyTile(raw, pixels, width, height, tileLeft, tileTop);
+    }
+
+    return { width, height, pixels };
+  }
+
+  // Copy one decompressed tile (alpha plane + BGRA) into an RGBA image.
+  function copyTile(raw, pixels, width, height, tileLeft, tileTop) {
+    const alphaPlane = 0;
+    const colorPlane = TILE_SIZE * TILE_SIZE;
+
+    for (let y = 0; y < TILE_SIZE && tileTop + y < height; y++) {
+      for (let x = 0; x < TILE_SIZE && tileLeft + x < width; x++) {
+        const tilePixel = y * TILE_SIZE + x;
+        const src = colorPlane + tilePixel * 4;
+        const dst = ((tileTop + y) * width + (tileLeft + x)) * 4;
+
+        pixels[dst] = raw[src + 2];     // R
+        pixels[dst + 1] = raw[src + 1]; // G
+        pixels[dst + 2] = raw[src];     // B
+        pixels[dst + 3] = raw[alphaPlane + tilePixel];
+      }
     }
   }
+
+  // Draw `above` over `below` in place (Float64 RGBA in 0..1, straight alpha).
+  // Same operation order as the Python version so the results match exactly.
+  function blendNormal(below, above, opacity) {
+    for (let i = 0; i < below.length; i += 4) {
+      const aboveAlpha = above[i + 3] * opacity;
+      const belowAlpha = below[i + 3];
+      const outAlpha = aboveAlpha + belowAlpha * (1 - aboveAlpha);
+
+      for (let c = 0; c < 3; c++) {
+        below[i + c] = outAlpha > 0
+          ? (above[i + c] * aboveAlpha + below[i + c] * belowAlpha * (1 - aboveAlpha)) / outAlpha
+          : 0;
+      }
+
+      below[i + 3] = outAlpha;
+    }
+  }
+
+
+  // ===========================================================================
+  // The document: layer tree, compositing and timeline
+  // ===========================================================================
 
   class Document {
     constructor(SQL, bytes) {
-      const { sql, ext } = readContainer(bytes);
-      this.ext = ext;
-      this.db = new SQL.Database(sql);
+      const { database, externals } = readClip(bytes);
+      this.externals = externals;
+      this.db = new SQL.Database(database);
       this.warnings = [];
-      const cv = query(this.db, "select * from Canvas")[0];
-      this.w = Math.round(cv.CanvasWidth); this.h = Math.round(cv.CanvasHeight);
-      this.root = cv.CanvasRootFolder;
-      this.layers = new Map(query(this.db, "select * from Layer").map((r) => [r.MainId, r]));
-    }
-    warn(msg) { if (!this.warnings.includes(msg)) this.warnings.push(msg); }
-    close() { this.db.close(); }
 
-    children(mid) { // bottom-most first
-      const out = [];
-      for (let c = this.layers.get(mid).LayerFirstChildIndex; c; c = this.layers.get(c).LayerNextIndex) out.push(c);
-      return out;
+      const canvas = sqlQuery(this.db, "select * from Canvas")[0];
+      this.width = Math.round(canvas.CanvasWidth);
+      this.height = Math.round(canvas.CanvasHeight);
+      this.root = canvas.CanvasRootFolder;
+
+      const layers = sqlQuery(this.db, "select * from Layer");
+      this.layers = new Map(layers.map((row) => [row.MainId, row]));
     }
 
-    async layerPixels(mid) {
-      const l = this.layers.get(mid);
-      const canvas = new Float64Array(this.w * this.h * 4);
-      const r = query(this.db,
-        "select o.Attribute a, cast(o.BlockData as text) b from Mipmap m " +
-        "join MipmapInfo i on i.MainId = m.BaseMipmapInfo " +
-        "join Offscreen o on o.MainId = i.Offscreen where m.MainId = ?", [l.LayerRenderMipmap])[0];
-      if (!r || !this.ext.has(r.b)) return canvas;
-      const off = await decodeOffscreen(r.a, this.ext.get(r.b));
-      const ox = l.LayerOffsetX + l.LayerRenderOffscrOffsetX, oy = l.LayerOffsetY + l.LayerRenderOffscrOffsetY;
-      const x0 = Math.max(0, ox), y0 = Math.max(0, oy);
-      const x1 = Math.min(this.w, ox + off.width), y1 = Math.min(this.h, oy + off.height);
-      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-        const s = ((y - oy) * off.width + (x - ox)) * 4, d = (y * this.w + x) * 4;
-        for (let k = 0; k < 4; k++) canvas[d + k] = off.px[s + k] / 255;
+    warn(message) {
+      if (!this.warnings.includes(message)) this.warnings.push(message);
+    }
+
+    close() {
+      this.db.close();
+    }
+
+    // ---- layer tree ---------------------------------------------------------
+
+    // Children of a folder, bottom-most first. Each layer links to its first
+    // child and its next sibling; the first child is the bottom of the stack.
+    children(layerId) {
+      const result = [];
+
+      let child = this.layers.get(layerId).LayerFirstChildIndex;
+      while (child) {
+        result.push(child);
+        child = this.layers.get(child).LayerNextIndex;
       }
+
+      return result;
+    }
+
+    // ---- pixels -------------------------------------------------------------
+
+    // A raster layer's pixels placed on a canvas-sized Float64 RGBA array.
+    async layerPixels(layerId) {
+      const layer = this.layers.get(layerId);
+      const canvas = new Float64Array(this.width * this.height * 4);
+
+      // Layer -> Mipmap -> MipmapInfo (full-size level) -> Offscreen
+      const row = sqlQuery(this.db,
+        "select o.Attribute as attribute, cast(o.BlockData as text) as blobName " +
+        "from Mipmap m " +
+        "join MipmapInfo i on i.MainId = m.BaseMipmapInfo " +
+        "join Offscreen o on o.MainId = i.Offscreen " +
+        "where m.MainId = ?",
+        [layer.LayerRenderMipmap])[0];
+
+      if (!row || !this.externals.has(row.blobName)) return canvas;
+
+      const image = await decodeOffscreen(row.attribute, this.externals.get(row.blobName));
+
+      // Where the pixel data's top-left corner sits on the canvas
+      const left = layer.LayerOffsetX + layer.LayerRenderOffscrOffsetX;
+      const top = layer.LayerOffsetY + layer.LayerRenderOffscrOffsetY;
+
+      // Clip to the canvas
+      const x0 = Math.max(0, left);
+      const y0 = Math.max(0, top);
+      const x1 = Math.min(this.width, left + image.width);
+      const y1 = Math.min(this.height, top + image.height);
+
+      for (let y = y0; y < y1; y++) {
+        for (let x = x0; x < x1; x++) {
+          const src = ((y - top) * image.width + (x - left)) * 4;
+          const dst = (y * this.width + x) * 4;
+          for (let c = 0; c < 4; c++) canvas[dst + c] = image.pixels[src + c] / 255;
+        }
+      }
+
       return canvas;
     }
 
-    async render(mid) {
-      const l = this.layers.get(mid);
-      if (!l.LayerFolder) return this.layerPixels(mid);
-      const acc = new Float64Array(this.w * this.h * 4);
-      for (const c of this.children(mid)) {
-        const cl = this.layers.get(c), name = cl.LayerName;
-        if (!((cl.LayerVisibility || 0) & 1)) continue;
-        if (cl.LayerType !== LAYER_FOLDER && cl.LayerType !== LAYER_RASTER) {
-          this.warn(`Layer "${name}" is a special layer type (vector, tone, paper…) and was skipped.`); continue;
+    // Composite a layer or folder into a Float64 RGBA canvas.
+    async render(layerId) {
+      const layer = this.layers.get(layerId);
+      if (!layer.LayerFolder) return this.layerPixels(layerId);
+
+      const result = new Float64Array(this.width * this.height * 4);
+
+      for (const childId of this.children(layerId)) {
+        const child = this.layers.get(childId);
+        const name = child.LayerName;
+
+        if (!((child.LayerVisibility || 0) & 1)) continue;
+
+        if (child.LayerType !== LAYER_FOLDER && child.LayerType !== LAYER_RASTER) {
+          this.warn(`Layer "${name}" is a special layer type (vector, tone, paper…) and was skipped.`);
+          continue;
         }
-        if (cl.LayerComposite) this.warn(`Layer "${name}" uses a blend mode; it was drawn as Normal.`);
-        if (cl.LayerClip) this.warn(`Layer "${name}" is a clipping layer; clipping was ignored.`);
-        if (cl.LayerLayerMaskMipmap) this.warn(`Layer "${name}" has a layer mask; the mask was ignored.`);
-        blendNormal(acc, await this.render(c), (cl.LayerOpacity || 0) / 256);
+
+        if (child.LayerComposite) this.warn(`Layer "${name}" uses a blend mode; it was drawn as Normal.`);
+        if (child.LayerClip) this.warn(`Layer "${name}" is a clipping layer; clipping was ignored.`);
+        if (child.LayerLayerMaskMipmap) this.warn(`Layer "${name}" has a layer mask; the mask was ignored.`);
+
+        const opacity = (child.LayerOpacity || 0) / 256;
+        blendNormal(result, await this.render(childId), opacity);
       }
-      return acc;
+
+      return result;
     }
 
+    // ---- timeline -----------------------------------------------------------
+
+    // Returns { fps, frames: [layer id or null for each frame] }, or null if there is no animation.
     async timeline() {
-      const tl = query(this.db, "select * from TimeLine order by MainId")[0];
-      if (!tl) return null;
-      const norm = (s) => String(s || "").toLowerCase().replace(/[^0-9a-f]/g, "");
-      const byUuid = new Map([...this.layers].map(([k, r]) => [norm(r.LayerUuid), k]));
-      const n = Math.round(tl.EndFrame - tl.StartFrame), start0 = Math.round(tl.StartFrame);
-      const frames = new Array(n).fill(null);
-      const tracks = query(this.db,
-        "select MainId, hex(LayerUuidWithTrack) u, TrackKind k, cast(TrackActionMixer2 as text) m " +
-        "from Track where BankId = ?", [tl.BankId]);
-      for (const t of tracks) {
-        if (t.k !== TRACK_KIND_CEL || !this.ext.has(t.m)) continue;
-        const lid = byUuid.get(norm(t.u));
-        if (lid === undefined) { this.warn(`A timeline track refers to a missing layer.`); continue; }
-        const [s, e] = await parseTimeClip(this.ext.get(t.m));
-        for (let f = Math.round(s / TIME_UNITS_PER_FRAME); f < Math.round(e / TIME_UNITS_PER_FRAME); f++) {
-          const i = f - start0;
-          if (i < 0 || i >= n) continue;
-          if (frames[i] !== null) this.warn(`Frame ${i + 1} is used by two cels; the later one was kept.`);
-          frames[i] = lid;
+      const timeline = sqlQuery(this.db, "select * from TimeLine order by MainId")[0];
+      if (!timeline) return null;
+
+      const firstFrame = Math.round(timeline.StartFrame);
+      const frameCount = Math.round(timeline.EndFrame - timeline.StartFrame);
+      const frames = new Array(frameCount).fill(null);
+
+      const layersByUuid = new Map();
+      for (const [layerId, row] of this.layers) layersByUuid.set(normalizeUuid(row.LayerUuid), layerId);
+
+      const tracks = sqlQuery(this.db,
+        "select MainId, hex(LayerUuidWithTrack) as uuid, TrackKind, " +
+        "cast(TrackActionMixer2 as text) as keys " +
+        "from Track where BankId = ?",
+        [timeline.BankId]);
+
+      for (const track of tracks) {
+        if (track.TrackKind !== TRACK_KIND_CEL || !this.externals.has(track.keys)) continue;
+
+        const layerId = layersByUuid.get(normalizeUuid(track.uuid));
+        if (layerId === undefined) {
+          this.warn("A timeline track refers to a missing layer.");
+          continue;
         }
-      }
-      return { fps: tl.FrameRate, frames };
-    }
-  }
 
-  async function parseTimeClip(blob) {
-    const zlen = u32le(blob, 8);
-    const z = await inflate(blob.subarray(12, 12 + zlen));
-    if (latin1(z.subarray(0, 12)) !== "cmt 0110binc") throw new Error("Unrecognised timeline format.");
-    const count = u32le(z, 16);
-    const names = [];
-    let p = 20;
-    for (let i = 0; i < count; i++) { const n = z[p]; names.push(latin1(z.subarray(p + 1, p + 1 + n))); p += 1 + n; }
-    const value = (field) => {
-      const hdr = new Uint8Array(20), dv = new DataView(hdr.buffer);
-      [0x10, 0x1c, 0x20, names.indexOf(field), names.indexOf("Double")].forEach((v, i) => dv.setUint32(i * 4, v));
-      const k = indexOf(z, hdr, p);
-      if (k < 0) throw new Error(`Timeline field ${field} not found.`);
-      return new DataView(z.buffer, z.byteOffset + k + 23, 8).getFloat64(0, true);
-    };
-    return [value("Start"), value("End")];
-  }
+        const [start, end] = await parseTimeClip(this.externals.get(track.keys));
+        const startFrame = Math.round(start / TIME_UNITS_PER_FRAME);
+        const endFrame = Math.round(end / TIME_UNITS_PER_FRAME);
 
-  // ------------------------------------------------------------------ .aseprite writer
-  class Buf {
-    constructor() { this.parts = []; this.len = 0; }
-    bytes(b) { this.parts.push(b); this.len += b.length; return this; }
-    fmt(spec, ...vals) { // little-endian: B=u8 H=u16 h=i16 I=u32 x=pad byte
-      const size = { B: 1, H: 2, h: 2, I: 4, x: 1 };
-      const b = new Uint8Array([...spec].reduce((a, c) => a + size[c], 0)), dv = new DataView(b.buffer);
-      let o = 0, v = 0;
-      for (const c of spec) {
-        if (c === "B") dv.setUint8(o, vals[v++]); else if (c === "H") dv.setUint16(o, vals[v++], true);
-        else if (c === "h") dv.setInt16(o, vals[v++], true); else if (c === "I") dv.setUint32(o, vals[v++], true);
-        o += size[c];
-      }
-      return this.bytes(b);
-    }
-    concat() { const out = new Uint8Array(this.len); let o = 0; for (const p of this.parts) { out.set(p, o); o += p.length; } return out; }
-  }
-  const chunk = (type, body) => new Buf().fmt("IH", body.length + 6, type).bytes(body).concat();
+        for (let frame = startFrame; frame < endFrame; frame++) {
+          const index = frame - firstFrame;
+          if (index < 0 || index >= frameCount) continue;
 
-  async function writeAseprite(frames, w, h, durationMs, layerName) {
-    const seen = new Map();
-    for (const f of frames) for (let i = 0; i < f.length; i += 4) {
-      if (!f[i + 3]) continue;
-      const key = ((f[i] << 24) >>> 0) + (f[i + 1] << 16) + (f[i + 2] << 8) + f[i + 3];
-      seen.set(key, true);
-    }
-    let colors = [...seen.keys()].sort((a, b) => a - b).slice(0, 256);
-    if (!colors.length) colors = [255];
-    const pal = new Buf().fmt("IIIxxxxxxxx", colors.length, 0, colors.length - 1);
-    for (const c of colors) pal.fmt("HBBBB", 0, c >>> 24, (c >> 16) & 255, (c >> 8) & 255, c & 255);
-    const profile = new Buf().fmt("HHIxxxxxxxx", 1, 0, 0).concat();
-    const nm = new TextEncoder().encode(layerName);
-    const layer = new Buf().fmt("HHHHHHBxxxH", 3, 0, 0, 0, 0, 0, 255, nm.length).bytes(nm).concat();
-
-    const body = new Buf();
-    for (let fi = 0; fi < frames.length; fi++) {
-      const img = frames[fi], chunks = [];
-      if (fi === 0) chunks.push(chunk(0x2007, profile), chunk(0x2019, pal.concat()), chunk(0x2004, layer));
-      let x0 = w, y0 = h, x1 = -1, y1 = -1;
-      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (img[(y * w + x) * 4 + 3]) {
-        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-      }
-      if (x1 >= 0) {
-        const cw = x1 - x0 + 1, ch = y1 - y0 + 1, px = new Uint8Array(cw * ch * 4);
-        for (let y = 0; y < ch; y++) px.set(img.subarray(((y0 + y) * w + x0) * 4, ((y0 + y) * w + x0 + cw) * 4), y * cw * 4);
-        const cel = new Buf().fmt("HhhBHhxxxxxHH", 0, x0, y0, 255, 2, 0, cw, ch).bytes(await deflate(px)).concat();
-        chunks.push(chunk(0x2005, cel));
-      }
-      const len = chunks.reduce((a, c) => a + c.length, 0);
-      body.fmt("IHHHxxI", 16 + len, 0xF1FA, Math.min(chunks.length, 0xFFFF), durationMs, chunks.length);
-      chunks.forEach((c) => body.bytes(c));
-    }
-    const header = new Buf().fmt("IHHHHHIHIIBxxxHBBhhHH", 128 + body.len, 0xA5E0, frames.length, w, h, 32, 1,
-      durationMs, 0, 0, 0, colors.length, 1, 1, 0, 0, 16, 16).concat();
-    const head = new Uint8Array(128); head.set(header);
-    return new Buf().bytes(head).bytes(body.concat()).concat();
-  }
-
-  // ------------------------------------------------------------------ public API
-  async function convert(SQL, bytes, opts = {}) {
-    const doc = new Document(SQL, bytes);
-    try {
-      const tl = await doc.timeline();
-      let fps, cels;
-      if (!tl || !tl.frames.some((f) => f !== null)) {
-        doc.warn("No animation timeline found, so the whole canvas was exported as one frame.");
-        fps = 12; cels = [doc.root];
-      } else ({ fps, frames: cels } = tl);
-      if (opts.fps) fps = opts.fps;
-      cels.forEach((c, i) => { if (c === null) doc.warn(`Frame ${i + 1} is empty on the timeline.`); });
-      const frames = [];
-      for (const c of cels) {
-        const px = new Uint8Array(doc.w * doc.h * 4);
-        if (c !== null) {
-          const f = await doc.render(c);
-          for (let i = 0; i < f.length; i += 4) {
-            const a = roundHalfEven(Math.min(1, Math.max(0, f[i + 3])) * 255);
-            if (!a) continue;
-            for (let k = 0; k < 3; k++) px[i + k] = roundHalfEven(Math.min(1, Math.max(0, f[i + k])) * 255);
-            px[i + 3] = a;
+          if (frames[index] !== null) {
+            this.warn(`Frame ${index + 1} is used by two cels; the later one was kept.`);
           }
+
+          frames[index] = layerId;
         }
-        frames.push(px);
       }
+
+      return { fps: timeline.FrameRate, frames };
+    }
+  }
+
+  // UUIDs are stored with inconsistent dashes; compare just the hex digits.
+  function normalizeUuid(value) {
+    return String(value || "").toLowerCase().replace(/[^0-9a-f]/g, "");
+  }
+
+  // Read the first TimeClip's Start and End from a track's key data.
+  //
+  // The blob is zlib-compressed CSP "binc" data: a table of names (field and
+  // type names) followed by records. A Double record looks like:
+  //
+  //   u32 0x10, u32 0x1c, u32 0x20, u32 field name index, u32 type name index,
+  //   3 bytes, f64 little-endian value
+  async function parseTimeClip(blob) {
+    const compressedLength = readU32LE(blob, 8);
+    const data = await zlibDecompress(blob.subarray(12, 12 + compressedLength));
+
+    if (latin1(data.subarray(0, 12)) !== "cmt 0110binc") {
+      throw new Error("Unrecognised timeline format.");
+    }
+
+    // Name table: u32 count, then length-prefixed strings
+    const nameCount = readU32LE(data, 16);
+    const names = [];
+    let pos = 20;
+    for (let i = 0; i < nameCount; i++) {
+      const length = data[pos];
+      names.push(latin1(data.subarray(pos + 1, pos + 1 + length)));
+      pos += 1 + length;
+    }
+
+    function readDouble(field) {
+      const header = new Uint8Array(20);
+      const view = new DataView(header.buffer);
+      const words = [0x10, 0x1c, 0x20, names.indexOf(field), names.indexOf("Double")];
+      words.forEach((word, i) => view.setUint32(i * 4, word, false));
+
+      const found = findBytes(data, header, pos);
+      if (found < 0) throw new Error(`Timeline field ${field} not found.`);
+
+      const valuePos = found + header.length + 3;
+      return new DataView(data.buffer, data.byteOffset + valuePos, 8).getFloat64(0, true);
+    }
+
+    return [readDouble("Start"), readDouble("End")];
+  }
+
+
+  // ===========================================================================
+  // Writing the .aseprite file
+  // ===========================================================================
+  //
+  // Format reference: https://github.com/aseprite/aseprite/blob/main/docs/ase-file-specs.md
+  //
+  // 128-byte header, then one frame block per frame. Frame 1 carries the colour
+  // profile, palette and layer chunks; every frame carries one compressed cel
+  // cropped to its visible pixels. All numbers are little-endian.
+
+  class ByteWriter {
+    constructor() {
+      this.parts = [];
+      this.length = 0;
+    }
+
+    bytes(data) {
+      this.parts.push(data);
+      this.length += data.length;
+      return this;
+    }
+
+    number(size, setter, value) {
+      const data = new Uint8Array(size);
+      new DataView(data.buffer)[setter](0, value, true);
+      return this.bytes(data);
+    }
+
+    u8(value) { return this.number(1, "setUint8", value); }
+    u16(value) { return this.number(2, "setUint16", value); }
+    i16(value) { return this.number(2, "setInt16", value); }
+    u32(value) { return this.number(4, "setUint32", value); }
+    zeros(count) { return this.bytes(new Uint8Array(count)); }
+
+    toBytes() {
+      const out = new Uint8Array(this.length);
+      let pos = 0;
+      for (const part of this.parts) {
+        out.set(part, pos);
+        pos += part.length;
+      }
+      return out;
+    }
+  }
+
+  function makeChunk(type, body) {
+    return new ByteWriter().u32(body.length + 6).u16(type).bytes(body).toBytes();
+  }
+
+  // Up to 256 visible colours, for the palette (informational in RGBA mode).
+  // Sorted by R, G, B, A like numpy.unique in the Python version.
+  function uniqueColors(frames) {
+    const seen = new Set();
+
+    for (const frame of frames) {
+      for (let i = 0; i < frame.length; i += 4) {
+        if (!frame[i + 3]) continue;
+        seen.add(((frame[i] << 24) >>> 0) + (frame[i + 1] << 16) + (frame[i + 2] << 8) + frame[i + 3]);
+      }
+    }
+
+    const colors = [...seen].sort((a, b) => a - b).slice(0, 256);
+    if (!colors.length) colors.push(255); // opaque black
+
+    return colors.map((c) => [c >>> 24, (c >> 16) & 255, (c >> 8) & 255, c & 255]);
+  }
+
+  // Bounding box of the non-transparent pixels, or null if the frame is empty.
+  function visibleBounds(image, width, height) {
+    let left = width, top = height, right = -1, bottom = -1;
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        if (!image[(y * width + x) * 4 + 3]) continue;
+        left = Math.min(left, x);
+        right = Math.max(right, x);
+        top = Math.min(top, y);
+        bottom = Math.max(bottom, y);
+      }
+    }
+
+    if (right < 0) return null;
+    return { left, top, width: right - left + 1, height: bottom - top + 1 };
+  }
+
+  function cropImage(image, imageWidth, box) {
+    const out = new Uint8Array(box.width * box.height * 4);
+
+    for (let y = 0; y < box.height; y++) {
+      const rowStart = ((box.top + y) * imageWidth + box.left) * 4;
+      out.set(image.subarray(rowStart, rowStart + box.width * 4), y * box.width * 4);
+    }
+
+    return out;
+  }
+
+  async function writeAseprite(frames, width, height, durationMs, layerName) {
+    const colors = uniqueColors(frames);
+
+    // Chunks that only appear in the first frame
+    const colorProfile = new ByteWriter()
+      .u16(1)      // sRGB
+      .u16(0)      // flags
+      .u32(0)      // gamma (unused)
+      .zeros(8)
+      .toBytes();
+
+    const palette = new ByteWriter()
+      .u32(colors.length)
+      .u32(0)                 // first index
+      .u32(colors.length - 1) // last index
+      .zeros(8);
+    for (const [r, g, b, a] of colors) palette.u16(0).u8(r).u8(g).u8(b).u8(a);
+
+    const nameBytes = new TextEncoder().encode(layerName);
+    const layer = new ByteWriter()
+      .u16(3)      // flags: visible + editable
+      .u16(0)      // normal layer
+      .u16(0)      // child level
+      .u16(0).u16(0)
+      .u16(0)      // blend mode: normal
+      .u8(255)     // opacity
+      .zeros(3)
+      .u16(nameBytes.length).bytes(nameBytes)
+      .toBytes();
+
+    // Frames
+    const body = new ByteWriter();
+
+    for (let index = 0; index < frames.length; index++) {
+      const image = frames[index];
+      const chunks = [];
+
+      if (index === 0) {
+        chunks.push(makeChunk(ASE_COLOR_PROFILE, colorProfile));
+        chunks.push(makeChunk(ASE_PALETTE, palette.toBytes()));
+        chunks.push(makeChunk(ASE_LAYER, layer));
+      }
+
+      const box = visibleBounds(image, width, height);
+      if (box) {
+        const pixels = await zlibCompress(cropImage(image, width, box));
+        const cel = new ByteWriter()
+          .u16(0)                 // layer index
+          .i16(box.left).i16(box.top)
+          .u8(255)                // opacity
+          .u16(2)                 // compressed image
+          .i16(0)                 // z-index
+          .zeros(5)
+          .u16(box.width).u16(box.height)
+          .bytes(pixels)
+          .toBytes();
+        chunks.push(makeChunk(ASE_CEL, cel));
+      }
+
+      const chunksLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      body
+        .u32(16 + chunksLength)
+        .u16(0xF1FA)                           // frame magic
+        .u16(Math.min(chunks.length, 0xFFFF))  // old chunk count
+        .u16(durationMs)
+        .zeros(2)
+        .u32(chunks.length);
+      chunks.forEach((chunk) => body.bytes(chunk));
+    }
+
+    // File header (padded to 128 bytes)
+    const header = new ByteWriter()
+      .u32(128 + body.length)  // file size
+      .u16(0xA5E0)             // magic
+      .u16(frames.length)
+      .u16(width).u16(height)
+      .u16(32)                 // bits per pixel: RGBA
+      .u32(1)                  // flags: layer opacity is valid
+      .u16(durationMs)         // deprecated speed
+      .u32(0).u32(0)
+      .u8(0)                   // transparent palette index
+      .zeros(3)
+      .u16(colors.length)
+      .u8(1).u8(1)             // pixel ratio 1:1
+      .i16(0).i16(0)           // grid position
+      .u16(16).u16(16);        // grid size
+    header.zeros(128 - header.length);
+
+    return new ByteWriter().bytes(header.toBytes()).bytes(body.toBytes()).toBytes();
+  }
+
+
+  // ===========================================================================
+  // Public API
+  // ===========================================================================
+
+  // Float 0..1 RGBA -> 8-bit RGBA; fully transparent pixels become (0, 0, 0, 0).
+  function toUint8(image) {
+    const out = new Uint8Array(image.length);
+    const to255 = (v) => roundHalfEven(Math.min(1, Math.max(0, v)) * 255);
+
+    for (let i = 0; i < image.length; i += 4) {
+      const alpha = to255(image[i + 3]);
+      if (!alpha) continue;
+
+      out[i] = to255(image[i]);
+      out[i + 1] = to255(image[i + 1]);
+      out[i + 2] = to255(image[i + 2]);
+      out[i + 3] = alpha;
+    }
+
+    return out;
+  }
+
+  async function convert(SQL, bytes, options = {}) {
+    const doc = new Document(SQL, bytes);
+
+    try {
+      // Decide which layer/folder becomes each frame
+      const timeline = await doc.timeline();
+      let fps, cels;
+
+      if (!timeline || !timeline.frames.some((cel) => cel !== null)) {
+        doc.warn("No animation timeline found, so the whole canvas was exported as one frame.");
+        fps = 12;
+        cels = [doc.root];
+      } else {
+        fps = timeline.fps;
+        cels = timeline.frames;
+      }
+
+      if (options.fps) fps = options.fps;
+
+      cels.forEach((cel, index) => {
+        if (cel === null) doc.warn(`Frame ${index + 1} is empty on the timeline.`);
+      });
+
+      // Render and write
+      const frames = [];
+      for (const cel of cels) {
+        if (cel === null) frames.push(new Uint8Array(doc.width * doc.height * 4));
+        else frames.push(toUint8(await doc.render(cel)));
+      }
+
       const durationMs = Math.max(1, Math.round(1000 / fps));
-      const aseprite = await writeAseprite(frames, doc.w, doc.h, durationMs, opts.layerName || "Sprite Sheet");
+      const aseprite = await writeAseprite(frames, doc.width, doc.height, durationMs,
+        options.layerName || "Sprite Sheet");
+
       return {
-        aseprite, frames, width: doc.w, height: doc.h, fps, durationMs, warnings: doc.warnings,
-        frameNames: cels.map((c) => (c === null ? "(empty)" : doc.layers.get(c).LayerName)),
+        aseprite,
+        frames,
+        width: doc.width,
+        height: doc.height,
+        fps,
+        durationMs,
+        warnings: doc.warnings,
+        frameNames: cels.map((cel) => (cel === null ? "(empty)" : doc.layers.get(cel).LayerName)),
       };
-    } finally { doc.close(); }
+    } finally {
+      doc.close();
+    }
   }
 
   const api = { convert };
+
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.Clip2Ase = api;
 })(typeof globalThis !== "undefined" ? globalThis : this);

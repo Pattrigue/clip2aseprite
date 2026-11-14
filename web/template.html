@@ -116,88 +116,196 @@
 </script>
 <script>
 "use strict";
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+
+// sql.js WebAssembly binary, inlined by build.py so the page works offline
 const WASM_B64 = "__WASM_BASE64__";
-const $ = (id) => document.getElementById(id);
+
+const isBrowserSupported =
+  typeof DecompressionStream !== "undefined" && typeof CompressionStream !== "undefined";
+
+const dropZone = document.getElementById("drop");
+const fileInput = document.getElementById("file");
+const fpsInput = document.getElementById("fps");
+const layerNameInput = document.getElementById("layerName");
+const resultsBar = document.getElementById("bar");
+const results = document.getElementById("results");
+const downloadAllButton = document.getElementById("all");
+
+// Download actions for every converted file, used by "Download all"
+const downloads = [];
+
+// sql.js is loaded once, the first time a file is converted
 let sqlPromise = null;
-function getSQL() {
+
+function loadSql() {
   if (!sqlPromise) {
-    const bin = Uint8Array.from(atob(WASM_B64), (c) => c.charCodeAt(0));
-    sqlPromise = initSqlJs({ wasmBinary: bin });
+    const wasm = Uint8Array.from(atob(WASM_B64), (ch) => ch.charCodeAt(0));
+    sqlPromise = initSqlJs({ wasmBinary: wasm });
   }
   return sqlPromise;
 }
-const supported = typeof DecompressionStream !== "undefined" && typeof CompressionStream !== "undefined";
-const downloads = [];
 
-function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
 
-function save(name, bytes) {
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function element(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  if (text != null) el.textContent = text;
+  return el;
+}
+
+function saveFile(name, bytes) {
   const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
-  const a = el("a"); a.href = url; a.download = name; document.body.append(a); a.click(); a.remove();
+
+  const link = element("a");
+  link.href = url;
+  link.download = name;
+  document.body.append(link);
+  link.click();
+  link.remove();
+
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
-function animate(canvas, r) {
-  canvas.width = r.width; canvas.height = r.height;
+// Loop the converted frames on a canvas.
+function playPreview(canvas, result) {
+  canvas.width = result.width;
+  canvas.height = result.height;
+
   const ctx = canvas.getContext("2d");
-  const imgs = r.frames.map((f) => new ImageData(new Uint8ClampedArray(f.buffer, f.byteOffset, f.length), r.width, r.height));
-  let i = 0;
-  const draw = () => { ctx.clearRect(0, 0, r.width, r.height); ctx.putImageData(imgs[i], 0, 0); i = (i + 1) % imgs.length; };
-  draw();
-  if (imgs.length > 1) setInterval(draw, r.durationMs);
+  const images = result.frames.map((frame) => new ImageData(
+    new Uint8ClampedArray(frame.buffer, frame.byteOffset, frame.length),
+    result.width, result.height));
+
+  let index = 0;
+  function drawNextFrame() {
+    ctx.clearRect(0, 0, result.width, result.height);
+    ctx.putImageData(images[index], 0, 0);
+    index = (index + 1) % images.length;
+  }
+
+  drawNextFrame();
+  if (images.length > 1) setInterval(drawNextFrame, result.durationMs);
 }
 
-async function handle(file) {
-  $("bar").style.display = "flex";
-  const card = el("div", "card");
-  const canvas = el("canvas", "preview"); canvas.width = canvas.height = 1;
-  const info = el("div", "info");
-  const outName = file.name.replace(/\.clip$/i, "") + ".aseprite";
-  info.append(el("div", "name", outName), el("div", "meta", "Converting…"));
-  card.append(canvas, info);
-  $("results").prepend(card);
-  const meta = info.querySelector(".meta");
+
+// ---------------------------------------------------------------------------
+// Converting a file
+// ---------------------------------------------------------------------------
+
+async function convertFile(file) {
+  const outputName = file.name.replace(/\.clip$/i, "") + ".aseprite";
+
+  // Result card: preview on the left, details on the right
+  const card = element("div", "card");
+  const preview = element("canvas", "preview");
+  preview.width = preview.height = 1;
+
+  const info = element("div", "info");
+  const meta = element("div", "meta", "Converting…");
+  info.append(element("div", "name", outputName), meta);
+
+  card.append(preview, info);
+  results.prepend(card);
+  resultsBar.style.display = "flex";
+
   try {
-    if (!supported) throw new Error("This browser is too old. Please open this page in an up-to-date Chrome, Edge or Firefox.");
-    if (!/\.clip$/i.test(file.name)) throw new Error("This isn't a .clip file.");
-    const SQL = await getSQL();
-    const fps = parseFloat($("fps").value);
-    const r = await Clip2Ase.convert(SQL, new Uint8Array(await file.arrayBuffer()), {
-      fps: fps > 0 ? fps : undefined, layerName: $("layerName").value.trim() || "Sprite Sheet",
+    if (!isBrowserSupported) {
+      throw new Error("This browser is too old. Please open this page in an up-to-date Chrome, Edge or Firefox.");
+    }
+    if (!/\.clip$/i.test(file.name)) {
+      throw new Error("This isn't a .clip file.");
+    }
+
+    const SQL = await loadSql();
+    const fps = parseFloat(fpsInput.value);
+    const result = await Clip2Ase.convert(SQL, new Uint8Array(await file.arrayBuffer()), {
+      fps: fps > 0 ? fps : undefined,
+      layerName: layerNameInput.value.trim() || "Sprite Sheet",
     });
-    animate(canvas, r);
-    meta.textContent = `${r.frames.length} frame${r.frames.length === 1 ? "" : "s"} · ${r.width}×${r.height} px · ${+r.fps.toFixed(2)} fps`;
-    if (r.warnings.length) {
-      const box = el("div", "msg warn"), ul = el("ul");
-      box.append(el("div", null, "Converted, but check these:"), ul);
-      r.warnings.forEach((w) => ul.append(el("li", null, w)));
+
+    playPreview(preview, result);
+
+    const frameCount = result.frames.length;
+    meta.textContent =
+      `${frameCount} frame${frameCount === 1 ? "" : "s"} · ` +
+      `${result.width}×${result.height} px · ${+result.fps.toFixed(2)} fps`;
+
+    if (result.warnings.length) {
+      const box = element("div", "msg warn");
+      const list = element("ul");
+      result.warnings.forEach((warning) => list.append(element("li", null, warning)));
+      box.append(element("div", null, "Converted, but check these:"), list);
       info.append(box);
     }
-    const btn = el("button", null, "Download");
-    btn.onclick = () => save(outName, r.aseprite);
-    info.append(btn);
-    downloads.push(() => save(outName, r.aseprite));
-    $("all").hidden = downloads.length < 2;
-  } catch (e) {
-    console.error(e);
+
+    const download = () => saveFile(outputName, result.aseprite);
+    const button = element("button", null, "Download");
+    button.onclick = download;
+    info.append(button);
+
+    downloads.push(download);
+    downloadAllButton.hidden = downloads.length < 2;
+  } catch (error) {
+    console.error(error);
     meta.textContent = file.name;
-    info.append(el("div", "msg error", "Couldn't convert this file. " + (e && e.message ? e.message : e)));
+    const message = error && error.message ? error.message : String(error);
+    info.append(element("div", "msg error", "Couldn't convert this file. " + message));
   }
 }
 
-async function handleAll(files) { for (const f of files) await handle(f); }
+async function convertFiles(files) {
+  for (const file of files) await convertFile(file);
+}
 
-const drop = $("drop");
-drop.onclick = () => $("file").click();
-drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("file").click(); } };
-$("file").onchange = (e) => { handleAll([...e.target.files]); e.target.value = ""; };
-["dragenter", "dragover"].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
-["dragleave", "drop"].forEach((t) => drop.addEventListener(t, () => drop.classList.remove("over")));
-drop.addEventListener("drop", (e) => { e.preventDefault(); handleAll([...e.dataTransfer.files]); });
-// dropping outside the box shouldn't make the browser open the file
-window.addEventListener("dragover", (e) => e.preventDefault());
-window.addEventListener("drop", (e) => { e.preventDefault(); if (e.target !== drop && !drop.contains(e.target)) handleAll([...e.dataTransfer.files]); });
-$("all").onclick = () => downloads.forEach((d, i) => setTimeout(d, i * 300));
+
+// ---------------------------------------------------------------------------
+// Events
+// ---------------------------------------------------------------------------
+
+// Click or keyboard: open the file picker
+dropZone.addEventListener("click", () => fileInput.click());
+dropZone.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    fileInput.click();
+  }
+});
+
+fileInput.addEventListener("change", () => {
+  convertFiles([...fileInput.files]);
+  fileInput.value = ""; // allow picking the same file again
+});
+
+// Drag and drop: highlight the drop zone while dragging over it
+for (const type of ["dragenter", "dragover"]) {
+  dropZone.addEventListener(type, (event) => {
+    event.preventDefault();
+    dropZone.classList.add("over");
+  });
+}
+for (const type of ["dragleave", "drop"]) {
+  dropZone.addEventListener(type, () => dropZone.classList.remove("over"));
+}
+
+// Accept drops anywhere on the page, so a near miss doesn't make the browser open the file
+window.addEventListener("dragover", (event) => event.preventDefault());
+window.addEventListener("drop", (event) => {
+  event.preventDefault();
+  convertFiles([...event.dataTransfer.files]);
+});
+
+// Stagger the downloads slightly so the browser doesn't drop any
+downloadAllButton.addEventListener("click", () => {
+  downloads.forEach((download, i) => setTimeout(download, i * 300));
+});
 </script>
 </body>
 </html>
