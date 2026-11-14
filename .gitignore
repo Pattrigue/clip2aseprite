@@ -1,0 +1,9 @@
+# build output
+clip2aseprite.html
+_site/
+
+# private test files (game art)
+testdata/
+
+__pycache__/
+*.aseprite
