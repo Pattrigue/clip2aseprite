@@ -20,16 +20,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
 
       - name: Build single-file HTML
-        run: python3 web/build.py _site/index.html
+        run: node web/build.cjs _site/index.html
 
       - name: Smoke test
         run: node tests/smoke.cjs _site/index.html

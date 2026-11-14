@@ -1,8 +1,8 @@
 // clip2aseprite: convert a Clip Studio Paint animation (.clip) into a flattened .aseprite file.
 //
-// This is the browser version of clip2aseprite.py and follows the same steps; see that
-// file for the same logic in Python. Runs in browsers and Node 18+. It needs
-// DecompressionStream, CompressionStream and an initialised sql.js `SQL` object.
+// Used by both the web page (template.html) and the command line (clip2aseprite.cjs).
+// Runs in browsers and Node 18+. It needs DecompressionStream, CompressionStream and
+// an initialised sql.js `SQL` object.
 //
 // Public API:  Clip2Ase.convert(SQL, clipBytes, { fps, layerName }) -> result
 
@@ -13,8 +13,9 @@
   const LAYER_FOLDER = 0;
   const LAYER_RASTER = 1;
 
-  // CSP timeline track that shows one animation cel (Track.TrackKind)
-  const TRACK_KIND_CEL = 1000;
+  // CSP timeline tracks that show/hide a folder or a layer (Track.TrackKind)
+  const TRACK_KIND_FOLDER = 1000;
+  const TRACK_KIND_LAYER = 2001;
 
   // The CSP timeline measures time in 1/5 frame units (a 12-frame animation ends at 60).
   const TIME_UNITS_PER_FRAME = 5;
@@ -92,7 +93,7 @@
     return runThroughStream(bytes, new CompressionStream("deflate"));
   }
 
-  // Round half to even, like numpy, so results match the Python version exactly.
+  // Round half to even (banker's rounding) for 0..1 -> 0..255.
   function roundHalfEven(x) {
     const rounded = Math.round(x);
     const isHalf = Math.abs(x % 1) === 0.5;
@@ -227,7 +228,6 @@
   }
 
   // Draw `above` over `below` in place (Float64 RGBA in 0..1, straight alpha).
-  // Same operation order as the Python version so the results match exactly.
   function blendNormal(below, above, opacity) {
     for (let i = 0; i < below.length; i += 4) {
       const aboveAlpha = above[i + 3] * opacity;
@@ -263,6 +263,13 @@
 
       const layers = sqlQuery(this.db, "select * from Layer");
       this.layers = new Map(layers.map((row) => [row.MainId, row]));
+
+      // Decoded layer pixels, reused when a layer appears in several frames
+      this.pixelCache = new Map();
+
+      // Frame range [start, end) per layer that is shown/hidden by the timeline.
+      // Layers without an entry are always visible. Filled in by loadTimeline().
+      this.visibleFrames = new Map();
     }
 
     warn(message) {
@@ -307,7 +314,10 @@
 
       if (!row || !this.externals.has(row.blobName)) return canvas;
 
-      const image = await decodeOffscreen(row.attribute, this.externals.get(row.blobName));
+      if (!this.pixelCache.has(layerId)) {
+        this.pixelCache.set(layerId, await decodeOffscreen(row.attribute, this.externals.get(row.blobName)));
+      }
+      const image = this.pixelCache.get(layerId);
 
       // Where the pixel data's top-left corner sits on the canvas
       const left = layer.LayerOffsetX + layer.LayerRenderOffscrOffsetX;
@@ -330,8 +340,14 @@
       return canvas;
     }
 
-    // Composite a layer or folder into a Float64 RGBA canvas.
-    async render(layerId) {
+    // Is this layer shown at this frame? (Layers without a timeline track always are.)
+    isVisibleAt(layerId, frame) {
+      const range = this.visibleFrames.get(layerId);
+      return !range || (frame >= range.start && frame < range.end);
+    }
+
+    // Composite a layer or folder, as it looks at `frame`, into a Float64 RGBA canvas.
+    async render(layerId, frame) {
       const layer = this.layers.get(layerId);
       if (!layer.LayerFolder) return this.layerPixels(layerId);
 
@@ -342,6 +358,7 @@
         const name = child.LayerName;
 
         if (!((child.LayerVisibility || 0) & 1)) continue;
+        if (!this.isVisibleAt(childId, frame)) continue;
 
         if (child.LayerType !== LAYER_FOLDER && child.LayerType !== LAYER_RASTER) {
           this.warn(`Layer "${name}" is a special layer type (vector, tone, paper…) and was skipped.`);
@@ -353,7 +370,7 @@
         if (child.LayerLayerMaskMipmap) this.warn(`Layer "${name}" has a layer mask; the mask was ignored.`);
 
         const opacity = (child.LayerOpacity || 0) / 256;
-        blendNormal(result, await this.render(childId), opacity);
+        blendNormal(result, await this.render(childId, frame), opacity);
       }
 
       return result;
@@ -361,14 +378,17 @@
 
     // ---- timeline -----------------------------------------------------------
 
-    // Returns { fps, frames: [layer id or null for each frame] }, or null if there is no animation.
-    async timeline() {
+    // Read the animation timeline and record when each tracked layer/folder is
+    // visible (this.visibleFrames). Returns { fps, firstFrame, frameCount },
+    // or null if the file has no animation.
+    //
+    // Cels can be folders (e.g. one folder of body parts per frame) or plain
+    // layers; both get a track with a TimeClip saying when they are shown.
+    // Layers inside a cel folder also have tracks, normally spanning the
+    // whole timeline.
+    async loadTimeline() {
       const timeline = sqlQuery(this.db, "select * from TimeLine order by MainId")[0];
       if (!timeline) return null;
-
-      const firstFrame = Math.round(timeline.StartFrame);
-      const frameCount = Math.round(timeline.EndFrame - timeline.StartFrame);
-      const frames = new Array(frameCount).fill(null);
 
       const layersByUuid = new Map();
       for (const [layerId, row] of this.layers) layersByUuid.set(normalizeUuid(row.LayerUuid), layerId);
@@ -380,7 +400,8 @@
         [timeline.BankId]);
 
       for (const track of tracks) {
-        if (track.TrackKind !== TRACK_KIND_CEL || !this.externals.has(track.keys)) continue;
+        if (track.TrackKind !== TRACK_KIND_FOLDER && track.TrackKind !== TRACK_KIND_LAYER) continue;
+        if (!this.externals.has(track.keys)) continue;
 
         const layerId = layersByUuid.get(normalizeUuid(track.uuid));
         if (layerId === undefined) {
@@ -389,22 +410,44 @@
         }
 
         const [start, end] = await parseTimeClip(this.externals.get(track.keys));
-        const startFrame = Math.round(start / TIME_UNITS_PER_FRAME);
-        const endFrame = Math.round(end / TIME_UNITS_PER_FRAME);
-
-        for (let frame = startFrame; frame < endFrame; frame++) {
-          const index = frame - firstFrame;
-          if (index < 0 || index >= frameCount) continue;
-
-          if (frames[index] !== null) {
-            this.warn(`Frame ${index + 1} is used by two cels; the later one was kept.`);
-          }
-
-          frames[index] = layerId;
-        }
+        this.visibleFrames.set(layerId, {
+          start: Math.round(start / TIME_UNITS_PER_FRAME),
+          end: Math.round(end / TIME_UNITS_PER_FRAME),
+        });
       }
 
-      return { fps: timeline.FrameRate, frames };
+      if (!this.visibleFrames.size) return null;
+
+      this.firstFrame = Math.round(timeline.StartFrame);
+      this.endFrame = Math.round(timeline.EndFrame);
+
+      return {
+        fps: timeline.FrameRate,
+        firstFrame: this.firstFrame,
+        frameCount: this.endFrame - this.firstFrame,
+      };
+    }
+
+    // Names of the timeline-controlled layers shown at `frame` that are
+    // themselves visible, outermost first (used to report what each frame shows).
+    celNamesAt(frame) {
+      const names = [];
+
+      const visit = (layerId) => {
+        for (const childId of this.children(layerId)) {
+          const child = this.layers.get(childId);
+          if (!((child.LayerVisibility || 0) & 1) || !this.isVisibleAt(childId, frame)) continue;
+
+          const range = this.visibleFrames.get(childId);
+          const isCel = range && !(range.start <= this.firstFrame && range.end >= this.endFrame);
+
+          if (isCel) names.push(child.LayerName);
+          else if (child.LayerFolder) visit(childId);
+        }
+      };
+
+      visit(this.root);
+      return names;
     }
   }
 
@@ -505,7 +548,7 @@
   }
 
   // Up to 256 visible colours, for the palette (informational in RGBA mode).
-  // Sorted by R, G, B, A like numpy.unique in the Python version.
+  // Sorted by R, G, B, A.
   function uniqueColors(frames) {
     const seen = new Set();
 
@@ -669,30 +712,30 @@
     const doc = new Document(SQL, bytes);
 
     try {
-      // Decide which layer/folder becomes each frame
-      const timeline = await doc.timeline();
-      let fps, cels;
+      // Work out which frames to render
+      const timeline = await doc.loadTimeline();
+      let fps = 12;
+      let frameNumbers = [0];
+      let frameNames = ["(whole canvas)"];
 
-      if (!timeline || !timeline.frames.some((cel) => cel !== null)) {
-        doc.warn("No animation timeline found, so the whole canvas was exported as one frame.");
-        fps = 12;
-        cels = [doc.root];
-      } else {
+      if (timeline) {
         fps = timeline.fps;
-        cels = timeline.frames;
+        frameNumbers = Array.from({ length: timeline.frameCount }, (_, i) => timeline.firstFrame + i);
+        frameNames = frameNumbers.map((frame) => doc.celNamesAt(frame).join(" + ") || "(empty)");
+
+        frameNames.forEach((name, index) => {
+          if (name === "(empty)") doc.warn(`Frame ${index + 1} has no cel on the timeline.`);
+        });
+      } else {
+        doc.warn("No animation timeline found, so the whole canvas was exported as one frame.");
       }
 
       if (options.fps) fps = options.fps;
 
-      cels.forEach((cel, index) => {
-        if (cel === null) doc.warn(`Frame ${index + 1} is empty on the timeline.`);
-      });
-
-      // Render and write
+      // Render each frame of the whole document, then write the file
       const frames = [];
-      for (const cel of cels) {
-        if (cel === null) frames.push(new Uint8Array(doc.width * doc.height * 4));
-        else frames.push(toUint8(await doc.render(cel)));
+      for (const frame of frameNumbers) {
+        frames.push(toUint8(await doc.render(doc.root, frame)));
       }
 
       const durationMs = Math.max(1, Math.round(1000 / fps));
@@ -707,7 +750,7 @@
         fps,
         durationMs,
         warnings: doc.warnings,
-        frameNames: cels.map((cel) => (cel === null ? "(empty)" : doc.layers.get(cel).LayerName)),
+        frameNames,
       };
     } finally {
       doc.close();

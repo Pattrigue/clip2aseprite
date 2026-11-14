@@ -43,6 +43,8 @@ assert.strictEqual(typeof ctx.Clip2Ase?.convert, "function", "converter did not 
     assert.strictEqual(a[4] | (a[5] << 8), 0xA5E0, "bad .aseprite magic");
     assert.strictEqual(a[6] | (a[7] << 8), r.frames.length, "frame count mismatch");
     assert(r.frames.some((fr) => fr.some((v, i) => i % 4 === 3 && v)), "all frames are empty");
+    assert(!r.warnings.some((w) => /no animation timeline/i.test(w)), "timeline not found");
+    assert(r.frames.length > 1, "expected an animation with more than one frame");
     console.log(`ok   ${f}: ${r.frames.length} frames ${r.width}x${r.height}` +
       (r.warnings.length ? ` (${r.warnings.length} warnings)` : ""));
   }
