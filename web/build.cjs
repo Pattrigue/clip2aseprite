@@ -10,24 +10,37 @@ const path = require("path");
 
 const web = __dirname;
 const read = (...parts) => fs.readFileSync(path.join(web, ...parts));
+const text = (...parts) => read(...parts).toString("utf8");
 
-const template = read("template.html").toString("utf8");
-const sqlJs = read("vendor", "sql-wasm.js").toString("utf8");
-const core = read("core.js").toString("utf8");
-const wasmBase64 = read("vendor", "sql-wasm.wasm").toString("base64");
+const scripts = {
+  "<!--SQLJS-->": text("vendor", "sql-wasm.js"),
+  "<!--SHARED-->": text("shared.js"),
+  "<!--CLIP_TO_ASEPRITE-->": text("clip-to-aseprite.js"),
+  "<!--ASEPRITE_TO_CLIP-->": text("aseprite-to-clip.js"),
+};
 
-// The scripts are inlined into <script> tags, which a literal "</script" would end early.
-for (const [name, js] of [["sql-wasm.js", sqlJs], ["core.js", core]]) {
+const data = {
+  "__WASM_BASE64__": read("vendor", "sql-wasm.wasm").toString("base64"),
+  "__CLIP_TEMPLATE_BASE64__": read("template.clip").toString("base64"),
+};
+
+let html = text("template.html");
+
+for (const [placeholder, js] of Object.entries(scripts)) {
+  // The scripts are inlined into <script> tags, which a literal "</script" would end early.
   if (js.toLowerCase().includes("</script")) {
-    throw new Error(`${name} contains '</script' and cannot be inlined as-is`);
+    throw new Error(`${placeholder} contains '</script' and cannot be inlined as-is`);
   }
+  if (!html.includes(placeholder)) throw new Error(`template.html has no ${placeholder}`);
+
+  // Function replacements, so "$" sequences in the code are inserted literally
+  html = html.replace(placeholder, () => js);
 }
 
-// Function replacements, so "$" sequences in the code are inserted literally
-const html = template
-  .replace("<!--SQLJS-->", () => sqlJs)
-  .replace("<!--CORE-->", () => core)
-  .replace("__WASM_BASE64__", () => wasmBase64);
+for (const [placeholder, value] of Object.entries(data)) {
+  if (!html.includes(placeholder)) throw new Error(`template.html has no ${placeholder}`);
+  html = html.replace(placeholder, () => value);
+}
 
 const output = process.argv[2] || path.join(web, "..", "clip2aseprite.html");
 fs.mkdirSync(path.dirname(path.resolve(output)), { recursive: true });

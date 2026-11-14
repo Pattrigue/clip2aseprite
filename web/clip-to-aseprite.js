@@ -1,13 +1,21 @@
-// clip2aseprite: convert a Clip Studio Paint animation (.clip) into a flattened .aseprite file.
+// Convert a Clip Studio Paint animation (.clip) into a flattened .aseprite file.
 //
-// Used by both the web page (template.html) and the command line (clip2aseprite.cjs).
-// Runs in browsers and Node 18+. It needs DecompressionStream, CompressionStream and
-// an initialised sql.js `SQL` object.
+// Each output frame is a render of the whole CSP document at that point on the
+// timeline, merged into a single Aseprite layer.
 //
 // Public API:  Clip2Ase.convert(SQL, clipBytes, { fps, layerName }) -> result
+// Needs shared.js and an initialised sql.js `SQL` object.
 
-(function (root) {
+(function (root, factory) {
+  if (typeof module !== "undefined" && module.exports) module.exports = factory(require("./shared.js"));
+  else root.Clip2Ase = factory(root.ClipShared);
+})(typeof globalThis !== "undefined" ? globalThis : this, function (shared) {
   "use strict";
+
+  const {
+    ByteWriter, zlibCompress, sqlQuery, readClip, decodeOffscreen,
+    decodeBinc, findDoubles, readDouble, blendNormal, toUint8,
+  } = shared;
 
   // CSP layer types (Layer.LayerType)
   const LAYER_FOLDER = 0;
@@ -17,232 +25,11 @@
   const TRACK_KIND_FOLDER = 1000;
   const TRACK_KIND_LAYER = 2001;
 
-  // The CSP timeline measures time in 1/5 frame units (a 12-frame animation ends at 60).
-  const TIME_UNITS_PER_FRAME = 5;
-
-  // Layer pixels are stored as square tiles of this size.
-  const TILE_SIZE = 256;
-
   // Aseprite chunk types
   const ASE_COLOR_PROFILE = 0x2007;
   const ASE_PALETTE = 0x2019;
   const ASE_LAYER = 0x2004;
   const ASE_CEL = 0x2005;
-
-
-  // ===========================================================================
-  // Small helpers
-  // ===========================================================================
-
-  function utf16be(text) {
-    const bytes = new Uint8Array(text.length * 2);
-    for (let i = 0; i < text.length; i++) {
-      bytes[2 * i] = text.charCodeAt(i) >> 8;
-      bytes[2 * i + 1] = text.charCodeAt(i) & 255;
-    }
-    return bytes;
-  }
-
-  function latin1(bytes) {
-    return String.fromCharCode.apply(null, bytes);
-  }
-
-  // Position of `needle` in `haystack` at or after `from`, or -1.
-  function findBytes(haystack, needle, from = 0) {
-    let i = haystack.indexOf(needle[0], from);
-
-    while (i !== -1 && i <= haystack.length - needle.length) {
-      let matches = true;
-      for (let j = 1; j < needle.length; j++) {
-        if (haystack[i + j] !== needle[j]) {
-          matches = false;
-          break;
-        }
-      }
-      if (matches) return i;
-
-      i = haystack.indexOf(needle[0], i + 1);
-    }
-
-    return -1;
-  }
-
-  function readU32BE(bytes, pos) {
-    return new DataView(bytes.buffer, bytes.byteOffset + pos, 4).getUint32(0, false);
-  }
-
-  function readU32LE(bytes, pos) {
-    return new DataView(bytes.buffer, bytes.byteOffset + pos, 4).getUint32(0, true);
-  }
-
-  function readU64BE(bytes, pos) {
-    return readU32BE(bytes, pos) * 2 ** 32 + readU32BE(bytes, pos + 4);
-  }
-
-  async function runThroughStream(bytes, stream) {
-    const response = new Response(new Blob([bytes]).stream().pipeThrough(stream));
-    return new Uint8Array(await response.arrayBuffer());
-  }
-
-  // "deflate" in the Streams API means zlib format, which is what both file formats use.
-  function zlibDecompress(bytes) {
-    return runThroughStream(bytes, new DecompressionStream("deflate"));
-  }
-
-  function zlibCompress(bytes) {
-    return runThroughStream(bytes, new CompressionStream("deflate"));
-  }
-
-  // Round half to even (banker's rounding) for 0..1 -> 0..255.
-  function roundHalfEven(x) {
-    const rounded = Math.round(x);
-    const isHalf = Math.abs(x % 1) === 0.5;
-    return isHalf && rounded % 2 !== 0 ? rounded - 1 : rounded;
-  }
-
-  function sqlQuery(db, sql, params) {
-    const statement = db.prepare(sql);
-    if (params) statement.bind(params);
-
-    const rows = [];
-    while (statement.step()) rows.push(statement.getAsObject());
-
-    statement.free();
-    return rows;
-  }
-
-
-  // ===========================================================================
-  // Reading the .clip container
-  // ===========================================================================
-  //
-  // A .clip file is a "CSFCHUNK" header followed by chunks. Each chunk is an
-  // 8-byte name, an 8-byte big-endian length and then the data:
-  //
-  //   CHNKHead   file header
-  //   CHNKExta   "external" data blob (pixels, timeline keys), named "extrnlid..."
-  //   CHNKSQLi   a SQLite database describing the document
-  //   CHNKFoot   end marker
-  //
-  // Database rows refer to external blobs by their name.
-
-  function readClip(data) {
-    if (latin1(data.subarray(0, 8)) !== "CSFCHUNK") {
-      throw new Error("This is not a Clip Studio Paint (.clip) file.");
-    }
-
-    const externals = new Map();
-    let database = null;
-
-    let pos = 24; // skip the file header
-    while (pos + 16 <= data.length) {
-      const chunkName = latin1(data.subarray(pos, pos + 8));
-      const chunkLength = readU64BE(data, pos + 8);
-      const body = data.subarray(pos + 16, pos + 16 + chunkLength);
-
-      if (chunkName === "CHNKExta") {
-        const nameLength = readU64BE(body, 0);
-        const name = latin1(body.subarray(8, 8 + nameLength));
-        externals.set(name, body.subarray(8 + nameLength));
-      } else if (chunkName === "CHNKSQLi") {
-        database = body;
-      }
-
-      pos += 16 + chunkLength;
-    }
-
-    if (!database) {
-      throw new Error("The .clip file has no layer database (is it damaged?).");
-    }
-
-    return { database, externals };
-  }
-
-
-  // ===========================================================================
-  // Layer pixels
-  // ===========================================================================
-  //
-  // A layer's pixels ("offscreen") are split into 256x256 tiles. The offscreen's
-  // Attribute blob holds its size and the number of tiles across/down. The pixel
-  // blob contains one "BlockDataBeginChunk" record per tile:
-  //
-  //   u32 tile index, u32 uncompressed size, u32 width, u32 height, u32 has_data,
-  //   u32 ?, u32 compressed length (little-endian!), zlib data
-  //
-  // Decompressed, a tile is a 256x256 alpha plane followed by 256x256 BGRA pixels
-  // (the A of BGRA is unused).
-
-  async function decodeOffscreen(attribute, data) {
-    const parameter = utf16be("Parameter");
-    const paramPos = findBytes(attribute, parameter);
-    if (paramPos < 0) throw new Error("Unrecognised layer pixel format.");
-
-    const sizePos = paramPos + parameter.length;
-    const width = readU32BE(attribute, sizePos);
-    const height = readU32BE(attribute, sizePos + 4);
-    const tilesAcross = readU32BE(attribute, sizePos + 8);
-
-    const pixels = new Uint8Array(width * height * 4);
-
-    const marker = utf16be("BlockDataBeginChunk");
-    for (let found = findBytes(data, marker); found !== -1; found = findBytes(data, marker, found + 1)) {
-      const pos = found + marker.length;
-
-      const tileIndex = readU32BE(data, pos);
-      const hasData = readU32BE(data, pos + 16);
-      if (!hasData) continue;
-
-      const compressedLength = readU32LE(data, pos + 24);
-      const raw = await zlibDecompress(data.subarray(pos + 28, pos + 28 + compressedLength));
-
-      if (raw.length !== TILE_SIZE * TILE_SIZE * 5) {
-        throw new Error("Only 32-bit colour layers are supported.");
-      }
-
-      const tileLeft = (tileIndex % tilesAcross) * TILE_SIZE;
-      const tileTop = Math.floor(tileIndex / tilesAcross) * TILE_SIZE;
-      copyTile(raw, pixels, width, height, tileLeft, tileTop);
-    }
-
-    return { width, height, pixels };
-  }
-
-  // Copy one decompressed tile (alpha plane + BGRA) into an RGBA image.
-  function copyTile(raw, pixels, width, height, tileLeft, tileTop) {
-    const alphaPlane = 0;
-    const colorPlane = TILE_SIZE * TILE_SIZE;
-
-    for (let y = 0; y < TILE_SIZE && tileTop + y < height; y++) {
-      for (let x = 0; x < TILE_SIZE && tileLeft + x < width; x++) {
-        const tilePixel = y * TILE_SIZE + x;
-        const src = colorPlane + tilePixel * 4;
-        const dst = ((tileTop + y) * width + (tileLeft + x)) * 4;
-
-        pixels[dst] = raw[src + 2];     // R
-        pixels[dst + 1] = raw[src + 1]; // G
-        pixels[dst + 2] = raw[src];     // B
-        pixels[dst + 3] = raw[alphaPlane + tilePixel];
-      }
-    }
-  }
-
-  // Draw `above` over `below` in place (Float64 RGBA in 0..1, straight alpha).
-  function blendNormal(below, above, opacity) {
-    for (let i = 0; i < below.length; i += 4) {
-      const aboveAlpha = above[i + 3] * opacity;
-      const belowAlpha = below[i + 3];
-      const outAlpha = aboveAlpha + belowAlpha * (1 - aboveAlpha);
-
-      for (let c = 0; c < 3; c++) {
-        below[i + c] = outAlpha > 0
-          ? (above[i + c] * aboveAlpha + below[i + c] * belowAlpha * (1 - aboveAlpha)) / outAlpha
-          : 0;
-      }
-
-      below[i + 3] = outAlpha;
-    }
-  }
 
 
   // ===========================================================================
@@ -409,10 +196,12 @@
           continue;
         }
 
-        const [start, end] = await parseTimeClip(this.externals.get(track.keys));
+        const clip = await readTimeClip(this.externals.get(track.keys));
+        const unitsPerFrame = clip.rate / timeline.FrameRate;
+
         this.visibleFrames.set(layerId, {
-          start: Math.round(start / TIME_UNITS_PER_FRAME),
-          end: Math.round(end / TIME_UNITS_PER_FRAME),
+          start: Math.round(clip.start / unitsPerFrame),
+          end: Math.round(clip.end / unitsPerFrame),
         });
       }
 
@@ -456,45 +245,20 @@
     return String(value || "").toLowerCase().replace(/[^0-9a-f]/g, "");
   }
 
-  // Read the first TimeClip's Start and End from a track's key data.
-  //
-  // The blob is zlib-compressed CSP "binc" data: a table of names (field and
-  // type names) followed by records. A Double record looks like:
-  //
-  //   u32 0x10, u32 0x1c, u32 0x20, u32 field name index, u32 type name index,
-  //   3 bytes, f64 little-endian value
-  async function parseTimeClip(blob) {
-    const compressedLength = readU32LE(blob, 8);
-    const data = await zlibDecompress(blob.subarray(12, 12 + compressedLength));
+  // The first TimeClip's Start and End, and the timeline Rate (units per second).
+  async function readTimeClip(blob) {
+    const binc = await decodeBinc(blob);
 
-    if (latin1(data.subarray(0, 12)) !== "cmt 0110binc") {
-      throw new Error("Unrecognised timeline format.");
-    }
+    const first = (field) => {
+      const positions = findDoubles(binc, field);
+      if (!positions.length) throw new Error(`Timeline field ${field} not found.`);
+      return readDouble(binc.data, positions[0]);
+    };
 
-    // Name table: u32 count, then length-prefixed strings
-    const nameCount = readU32LE(data, 16);
-    const names = [];
-    let pos = 20;
-    for (let i = 0; i < nameCount; i++) {
-      const length = data[pos];
-      names.push(latin1(data.subarray(pos + 1, pos + 1 + length)));
-      pos += 1 + length;
-    }
+    const ratePositions = findDoubles(binc, "Rate");
+    const rate = ratePositions.length ? readDouble(binc.data, ratePositions[0]) : 60;
 
-    function readDouble(field) {
-      const header = new Uint8Array(20);
-      const view = new DataView(header.buffer);
-      const words = [0x10, 0x1c, 0x20, names.indexOf(field), names.indexOf("Double")];
-      words.forEach((word, i) => view.setUint32(i * 4, word, false));
-
-      const found = findBytes(data, header, pos);
-      if (found < 0) throw new Error(`Timeline field ${field} not found.`);
-
-      const valuePos = found + header.length + 3;
-      return new DataView(data.buffer, data.byteOffset + valuePos, 8).getFloat64(0, true);
-    }
-
-    return [readDouble("Start"), readDouble("End")];
+    return { start: first("Start"), end: first("End"), rate };
   }
 
 
@@ -507,41 +271,6 @@
   // 128-byte header, then one frame block per frame. Frame 1 carries the colour
   // profile, palette and layer chunks; every frame carries one compressed cel
   // cropped to its visible pixels. All numbers are little-endian.
-
-  class ByteWriter {
-    constructor() {
-      this.parts = [];
-      this.length = 0;
-    }
-
-    bytes(data) {
-      this.parts.push(data);
-      this.length += data.length;
-      return this;
-    }
-
-    number(size, setter, value) {
-      const data = new Uint8Array(size);
-      new DataView(data.buffer)[setter](0, value, true);
-      return this.bytes(data);
-    }
-
-    u8(value) { return this.number(1, "setUint8", value); }
-    u16(value) { return this.number(2, "setUint16", value); }
-    i16(value) { return this.number(2, "setInt16", value); }
-    u32(value) { return this.number(4, "setUint32", value); }
-    zeros(count) { return this.bytes(new Uint8Array(count)); }
-
-    toBytes() {
-      const out = new Uint8Array(this.length);
-      let pos = 0;
-      for (const part of this.parts) {
-        out.set(part, pos);
-        pos += part.length;
-      }
-      return out;
-    }
-  }
 
   function makeChunk(type, body) {
     return new ByteWriter().u32(body.length + 6).u16(type).bytes(body).toBytes();
@@ -690,24 +419,6 @@
   // Public API
   // ===========================================================================
 
-  // Float 0..1 RGBA -> 8-bit RGBA; fully transparent pixels become (0, 0, 0, 0).
-  function toUint8(image) {
-    const out = new Uint8Array(image.length);
-    const to255 = (v) => roundHalfEven(Math.min(1, Math.max(0, v)) * 255);
-
-    for (let i = 0; i < image.length; i += 4) {
-      const alpha = to255(image[i + 3]);
-      if (!alpha) continue;
-
-      out[i] = to255(image[i]);
-      out[i + 1] = to255(image[i + 1]);
-      out[i + 2] = to255(image[i + 2]);
-      out[i + 3] = alpha;
-    }
-
-    return out;
-  }
-
   async function convert(SQL, bytes, options = {}) {
     const doc = new Document(SQL, bytes);
 
@@ -757,8 +468,5 @@
     }
   }
 
-  const api = { convert };
-
-  if (typeof module !== "undefined" && module.exports) module.exports = api;
-  else root.Clip2Ase = api;
-})(typeof globalThis !== "undefined" ? globalThis : this);
+  return { convert };
+});

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CLIP to Aseprite</title>
+<title>CLIP and Aseprite</title>
 <style>
   :root {
     --bg: #f6f5f8; --surface: #ffffff; --text: #1d1b22; --muted: #6a6575;
@@ -80,23 +80,23 @@
 </head>
 <body>
 <main>
-  <h1>CLIP → Aseprite</h1>
-  <p class="lede">Turns a Clip Studio Paint animation into an Aseprite file — one frame per cel, layers flattened.</p>
+  <h1>CLIP ⇄ Aseprite</h1>
+  <p class="lede">Turns Clip Studio Paint animations into Aseprite files, and Aseprite files into Clip Studio Paint animations. Frames are flattened to one layer each.</p>
 
-  <div id="drop" role="button" tabindex="0" aria-label="Choose .clip files">
+  <div id="drop" role="button" tabindex="0" aria-label="Choose .clip or .aseprite files">
     <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 15V3m0 0 4.5 4.5M12 3 7.5 7.5"/><path d="M3 15v4a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-4"/></svg>
-    <strong>Drop .clip files here</strong>
+    <strong>Drop .clip or .aseprite files here</strong>
     <span>or click to choose them</span>
   </div>
-  <input id="file" type="file" accept=".clip" multiple hidden>
+  <input id="file" type="file" accept=".clip,.aseprite,.ase" multiple hidden>
 
   <details>
     <summary>Options</summary>
     <div class="opts">
       <label>Frame rate (fps)
-        <input id="fps" type="number" min="1" max="120" step="1" placeholder="from the .clip file">
+        <input id="fps" type="number" min="1" max="60" step="1" placeholder="from the file">
       </label>
-      <label>Layer name
+      <label>Layer name (Aseprite output)
         <input id="layerName" type="text" value="Sprite Sheet">
       </label>
     </div>
@@ -112,7 +112,13 @@
 <!--SQLJS-->
 </script>
 <script>
-<!--CORE-->
+<!--SHARED-->
+</script>
+<script>
+<!--CLIP_TO_ASEPRITE-->
+</script>
+<script>
+<!--ASEPRITE_TO_CLIP-->
 </script>
 <script>
 "use strict";
@@ -121,8 +127,10 @@
 // Setup
 // ---------------------------------------------------------------------------
 
-// sql.js WebAssembly binary, inlined by build.cjs so the page works offline
+// Inlined by build.cjs so the page works offline:
+// the sql.js WebAssembly binary, and the CSP file used as a template for .clip output
 const WASM_B64 = "__WASM_BASE64__";
+const CLIP_TEMPLATE_B64 = "__CLIP_TEMPLATE_BASE64__";
 
 const isBrowserSupported =
   typeof DecompressionStream !== "undefined" && typeof CompressionStream !== "undefined";
@@ -142,10 +150,7 @@ const downloads = [];
 let sqlPromise = null;
 
 function loadSql() {
-  if (!sqlPromise) {
-    const wasm = Uint8Array.from(atob(WASM_B64), (ch) => ch.charCodeAt(0));
-    sqlPromise = initSqlJs({ wasmBinary: wasm });
-  }
+  if (!sqlPromise) sqlPromise = initSqlJs({ wasmBinary: fromBase64(WASM_B64) });
   return sqlPromise;
 }
 
@@ -153,6 +158,10 @@ function loadSql() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+function fromBase64(text) {
+  return Uint8Array.from(atob(text), (ch) => ch.charCodeAt(0));
+}
 
 function element(tag, className, text) {
   const el = document.createElement(tag);
@@ -174,25 +183,29 @@ function saveFile(name, bytes) {
   setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
-// Loop the converted frames on a canvas.
-function playPreview(canvas, result) {
-  canvas.width = result.width;
-  canvas.height = result.height;
+// Loop frames (8-bit RGBA) on a canvas, each shown for its duration in ms.
+function playPreview(canvas, frames, width, height, durations) {
+  canvas.width = width;
+  canvas.height = height;
 
   const ctx = canvas.getContext("2d");
-  const images = result.frames.map((frame) => new ImageData(
-    new Uint8ClampedArray(frame.buffer, frame.byteOffset, frame.length),
-    result.width, result.height));
+  const images = frames.map((frame) => new ImageData(
+    new Uint8ClampedArray(frame.buffer, frame.byteOffset, frame.length), width, height));
 
   let index = 0;
   function drawNextFrame() {
-    ctx.clearRect(0, 0, result.width, result.height);
+    ctx.clearRect(0, 0, width, height);
     ctx.putImageData(images[index], 0, 0);
+    const delay = durations[index];
     index = (index + 1) % images.length;
+    if (images.length > 1) setTimeout(drawNextFrame, delay);
   }
 
   drawNextFrame();
-  if (images.length > 1) setInterval(drawNextFrame, result.durationMs);
+}
+
+function plural(count, word) {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
 }
 
 
@@ -200,8 +213,50 @@ function playPreview(canvas, result) {
 // Converting a file
 // ---------------------------------------------------------------------------
 
+// The two directions: what they accept, produce, and how to run them
+const CONVERTERS = [
+  {
+    accepts: /\.clip$/i,
+    outputExtension: ".aseprite",
+    async run(SQL, bytes, fps) {
+      const result = await Clip2Ase.convert(SQL, bytes, {
+        fps, layerName: layerNameInput.value.trim() || "Sprite Sheet",
+      });
+      return {
+        output: result.aseprite,
+        frames: result.frames,
+        width: result.width,
+        height: result.height,
+        durations: result.frames.map(() => result.durationMs),
+        summary: `${plural(result.frames.length, "frame")} · ${result.width}×${result.height} px · ` +
+          `${+result.fps.toFixed(2)} fps`,
+        warnings: result.warnings,
+      };
+    },
+  },
+  {
+    accepts: /\.(aseprite|ase)$/i,
+    outputExtension: ".clip",
+    async run(SQL, bytes, fps) {
+      const result = await Ase2Clip.convert(SQL, bytes, fromBase64(CLIP_TEMPLATE_B64), { fps });
+      return {
+        output: result.clip,
+        frames: result.frames,
+        width: result.width,
+        height: result.height,
+        durations: result.holds.map((hold) => (hold * 1000) / result.fps),
+        summary: `${plural(result.frames.length, "layer")} · ${result.width}×${result.height} px · ` +
+          `${result.fps} fps`,
+        warnings: result.warnings,
+      };
+    },
+  },
+];
+
 async function convertFile(file) {
-  const outputName = file.name.replace(/\.clip$/i, "") + ".aseprite";
+  const converter = CONVERTERS.find((c) => c.accepts.test(file.name));
+  const baseName = file.name.replace(/\.(clip|aseprite|ase)$/i, "");
+  const outputName = converter ? baseName + converter.outputExtension : file.name;
 
   // Result card: preview on the left, details on the right
   const card = element("div", "card");
@@ -220,23 +275,16 @@ async function convertFile(file) {
     if (!isBrowserSupported) {
       throw new Error("This browser is too old. Please open this page in an up-to-date Chrome, Edge or Firefox.");
     }
-    if (!/\.clip$/i.test(file.name)) {
-      throw new Error("This isn't a .clip file.");
+    if (!converter) {
+      throw new Error("Only .clip, .aseprite and .ase files can be converted.");
     }
 
     const SQL = await loadSql();
     const fps = parseFloat(fpsInput.value);
-    const result = await Clip2Ase.convert(SQL, new Uint8Array(await file.arrayBuffer()), {
-      fps: fps > 0 ? fps : undefined,
-      layerName: layerNameInput.value.trim() || "Sprite Sheet",
-    });
+    const result = await converter.run(SQL, new Uint8Array(await file.arrayBuffer()), fps > 0 ? fps : undefined);
 
-    playPreview(preview, result);
-
-    const frameCount = result.frames.length;
-    meta.textContent =
-      `${frameCount} frame${frameCount === 1 ? "" : "s"} · ` +
-      `${result.width}×${result.height} px · ${+result.fps.toFixed(2)} fps`;
+    playPreview(preview, result.frames, result.width, result.height, result.durations);
+    meta.textContent = result.summary;
 
     if (result.warnings.length) {
       const box = element("div", "msg warn");
@@ -246,7 +294,7 @@ async function convertFile(file) {
       info.append(box);
     }
 
-    const download = () => saveFile(outputName, result.aseprite);
+    const download = () => saveFile(outputName, result.output);
     const button = element("button", null, "Download");
     button.onclick = download;
     info.append(button);
